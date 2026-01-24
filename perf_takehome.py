@@ -298,7 +298,7 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # --- Vector Allocation ---
-        UNROLL = 4
+        UNROLL = 16
         
         # Helper to alloc array of vectors
         def alloc_vec_array(name, count):
@@ -308,10 +308,9 @@ class KernelBuilder:
         v_val = alloc_vec_array("v_val", UNROLL)
         v_node_val = alloc_vec_array("v_node_val", UNROLL)
         
-        # Temps for math - independent per unroll
+        # Temps for math
         v_tmp1 = alloc_vec_array("v_tmp1", UNROLL)
         v_tmp2 = alloc_vec_array("v_tmp2", UNROLL)
-        v_tmp3 = alloc_vec_array("v_tmp3", UNROLL)
 
         # Temp vector for address calculations
         t_addrs = alloc_vec_array("t_addrs", UNROLL)
@@ -368,7 +367,6 @@ class KernelBuilder:
                         "t_addrs": t_addrs[u],
                         "v_tmp1": v_tmp1[u],
                         "v_tmp2": v_tmp2[u],
-                        "v_tmp3": v_tmp3[u],
                         "addr_reg": addr_regs[u],
                         "b_start_k": b_start_k,
                     }
@@ -427,10 +425,9 @@ class KernelBuilder:
                     # Index Update
                     self.add("valu", ("%", res["v_tmp1"], res["v_val"], v_two))
                     self.add("valu", ("==", res["v_tmp2"], res["v_tmp1"], v_zero))
-                    self.add("flow", ("vselect", res["v_tmp3"], res["v_tmp2"], v_one, v_two))
+                    self.add("flow", ("vselect", res["v_tmp1"], res["v_tmp2"], v_one, v_two))
                     
-                    self.add("valu", ("*", res["v_idx"], res["v_idx"], v_two))
-                    self.add("valu", ("+", res["v_idx"], res["v_idx"], res["v_tmp3"]))
+                    self.add("valu", ("multiply_add", res["v_idx"], res["v_idx"], v_two, res["v_tmp1"]))
 
                     # Wrap
                     self.add("valu", ("<", res["v_tmp1"], res["v_idx"], v_n_nodes))
