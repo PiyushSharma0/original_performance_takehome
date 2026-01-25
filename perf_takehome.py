@@ -67,7 +67,6 @@ class KernelBuilder:
             self.builder = builder
             self.current_bundle = defaultdict(list)
             self.current_writes = set()
-            # self.current_reads = set() # We don't strictly need to track reads for correctness of THIS bundle, but WAR is allowed.
             
         def flush(self):
             if self.current_bundle:
@@ -298,7 +297,7 @@ class KernelBuilder:
         self.add("debug", ("comment", "Starting loop"))
 
         # --- Vector Allocation ---
-        UNROLL = 16
+        UNROLL = 16  # Optimal balance
         
         # Helper to alloc array of vectors
         def alloc_vec_array(name, count):
@@ -306,14 +305,11 @@ class KernelBuilder:
 
         v_idx = alloc_vec_array("v_idx", UNROLL)
         v_val = alloc_vec_array("v_val", UNROLL)
-        v_node_val = alloc_vec_array("v_node_val", UNROLL)
+        t_addrs = alloc_vec_array("t_addrs", UNROLL)  # Also used as v_node_val
         
         # Temps for math
         v_tmp1 = alloc_vec_array("v_tmp1", UNROLL)
         v_tmp2 = alloc_vec_array("v_tmp2", UNROLL)
-
-        # Temp vector for address calculations
-        t_addrs = alloc_vec_array("t_addrs", UNROLL)
         
         # Constants/Broadcasts shared
         v_forest_base = self.alloc_scratch("v_forest_base", VLEN)
@@ -342,9 +338,12 @@ class KernelBuilder:
         self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
 
         # We process 'batch_size' items.
-        # Loop over batch in chunks of VLEN * UNROLL
         step_size = VLEN * UNROLL
-        for r_num in range(rounds):
+        ROUND_FUSION = 16  # Process all 16 rounds together
+        
+        for r_start in range(0, rounds, ROUND_FUSION):
+            rounds_this_group = min(ROUND_FUSION, rounds - r_start)
+            
             for b_start in range(0, batch_size, step_size):
                 
                 # State for each unroll lane
@@ -363,7 +362,7 @@ class KernelBuilder:
                         "idx_k": current_batch_idx,
                         "v_idx": v_idx[u],
                         "v_val": v_val[u],
-                        "v_node_val": v_node_val[u],
+                        "v_node_val": t_addrs[u],  # Reuse t_addrs
                         "t_addrs": t_addrs[u],
                         "v_tmp1": v_tmp1[u],
                         "v_tmp2": v_tmp2[u],
@@ -380,63 +379,91 @@ class KernelBuilder:
                     self.add("alu", ("+", res["addr_reg"], self.scratch["inp_values_p"], b_start_k))
                     self.add("load", ("vload", res["v_val"], res["addr_reg"]))
 
-                # --- 2. Gather ---
+                # Pipeline structure: issue loads early, do other work, then use loaded data
+                # Round 0: gather
                 for u in range(UNROLL):
                     res = batch_res[u]
                     if res is None: continue
-                    
-                    # Calc addresses
                     self.add("valu", ("+", res["t_addrs"], v_forest_base, res["v_idx"]))
-                    
-                    # Load from addresses
-                    for i in range(VLEN):
+                for i in range(VLEN):
+                    for u in range(UNROLL):
+                        res = batch_res[u]
+                        if res is None: continue
                         self.add("load", ("load", res["v_node_val"] + i, res["t_addrs"] + i))
+                
+                for r_offset in range(rounds_this_group):
+                    # Process hash and update
+                    # XOR
+                    for u in range(UNROLL):
+                        res = batch_res[u]
+                        if res is None: continue
+                        self.add("valu", ("^", res["v_val"], res["v_val"], res["v_node_val"]))
                     
-                # --- 3. Hash ---
-                # Init hash (XOR)
-                for u in range(UNROLL):
-                    res = batch_res[u]
-                    if res is None: continue
-                    self.add("valu", ("^", res["v_val"], res["v_val"], res["v_node_val"]))
-
-                # Interleaved Stages
-                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    # Hash stage 0 (op1, op3 independent)
+                    op1, val1, op2, op3, val3 = HASH_STAGES[0]
                     k1 = hash_consts[val1]
                     k3 = hash_consts[val3]
-                    
-                    # Op1 & Op3 (Independent)
                     for u in range(UNROLL):
                         res = batch_res[u]
                         if res is None: continue
                         self.add("valu", (op1, res["v_tmp1"], res["v_val"], k1))
                         self.add("valu", (op3, res["v_tmp2"], res["v_val"], k3))
                     
-                    # Op2 (Depends on above)
+                    # Start next round's address calculation and loads (if not last round)
+                    # This happens BEFORE we finish hash, allowing overlap
+                    if r_offset < rounds_this_group - 1:
+                        # Need to compute new addresses based on CURRENT idx (before update)
+                        # But we can't - we need the hash result to update idx first
+                        pass
+                    
+                    # Finish hash stage 0
                     for u in range(UNROLL):
-                         res = batch_res[u]
-                         if res is None: continue
-                         self.add("valu", (op2, res["v_val"], res["v_tmp1"], res["v_tmp2"]))
+                        res = batch_res[u]
+                        if res is None: continue
+                        self.add("valu", (op2, res["v_val"], res["v_tmp1"], res["v_tmp2"]))
+                    
+                    # Hash stages 1-5
+                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES[1:], 1):
+                        k1 = hash_consts[val1]
+                        k3 = hash_consts[val3]
+                        for u in range(UNROLL):
+                            res = batch_res[u]
+                            if res is None: continue
+                            self.add("valu", (op1, res["v_tmp1"], res["v_val"], k1))
+                            self.add("valu", (op3, res["v_tmp2"], res["v_val"], k3))
+                        for u in range(UNROLL):
+                            res = batch_res[u]
+                            if res is None: continue
+                            self.add("valu", (op2, res["v_val"], res["v_tmp1"], res["v_tmp2"]))
+                    
+                    # Update idx
+                    for u in range(UNROLL):
+                        res = batch_res[u]
+                        if res is None: continue
+                        self.add("valu", ("&", res["v_tmp1"], res["v_val"], v_one))
+                        self.add("valu", ("+", res["v_tmp1"], res["v_tmp1"], v_one))
+                        self.add("valu", ("multiply_add", res["v_idx"], res["v_idx"], v_two, res["v_tmp1"]))
+                        self.add("valu", ("<", res["v_tmp1"], res["v_idx"], v_n_nodes))
+                        self.add("valu", ("*", res["v_idx"], res["v_idx"], res["v_tmp1"]))
+                    
+                    # Gather for next round (if not last)
+                    if r_offset < rounds_this_group - 1:
+                        for u in range(UNROLL):
+                            res = batch_res[u]
+                            if res is None: continue
+                            self.add("valu", ("+", res["t_addrs"], v_forest_base, res["v_idx"]))
+                        for i in range(VLEN):
+                            for u in range(UNROLL):
+                                res = batch_res[u]
+                                if res is None: continue
+                                self.add("load", ("load", res["v_node_val"] + i, res["t_addrs"] + i))
 
-                # --- 4. Update & Store ---
+                # Store after all fused rounds
                 for u in range(UNROLL):
                     res = batch_res[u]
                     if res is None: continue
-                    
-                    # Index Update
-                    self.add("valu", ("%", res["v_tmp1"], res["v_val"], v_two))
-                    self.add("valu", ("==", res["v_tmp2"], res["v_tmp1"], v_zero))
-                    self.add("flow", ("vselect", res["v_tmp1"], res["v_tmp2"], v_one, v_two))
-                    
-                    self.add("valu", ("multiply_add", res["v_idx"], res["v_idx"], v_two, res["v_tmp1"]))
-
-                    # Wrap
-                    self.add("valu", ("<", res["v_tmp1"], res["v_idx"], v_n_nodes))
-                    self.add("flow", ("vselect", res["v_idx"], res["v_tmp1"], res["v_idx"], v_zero))
-
-                    # Store
                     self.add("alu", ("+", res["addr_reg"], self.scratch["inp_indices_p"], res["b_start_k"]))
                     self.add("store", ("vstore", res["addr_reg"], res["v_idx"]))
-                    
                     self.add("alu", ("+", res["addr_reg"], self.scratch["inp_values_p"], res["b_start_k"]))
                     self.add("store", ("vstore", res["addr_reg"], res["v_val"]))
 
