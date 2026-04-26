@@ -258,214 +258,256 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        # Load initial scalars
-        # tmp_scalar is for loading constants/initial values
+        # Load initial scalars.
         tmp_scalar = self.alloc_scratch("tmp_scalar", 1)
         for i, v in enumerate(init_vars):
             self.add("load", ("const", tmp_scalar, i))
             self.add("load", ("load", self.scratch[v], tmp_scalar))
 
-        # --- Constants Setup ---
-        # We need vector constants for the hash function and logic
-        # (0, 1, 2)
-        v_zero = self.alloc_scratch("v_zero", VLEN)
-        v_one = self.alloc_scratch("v_one", VLEN)
-        v_two = self.alloc_scratch("v_two", VLEN)
-        
-        # Helper to broadcast scalar const to vector
-        def broadcast_const(dest_vec, val):
-            # Load scalar
+        # Broadcast constants used throughout the kernel.
+        def broadcast_const(name, val):
+            addr = self.alloc_scratch(name, VLEN)
             self.add("load", ("const", tmp_scalar, val))
-            # Broadcast
-            self.add("valu", ("vbroadcast", dest_vec, tmp_scalar))
+            self.add("valu", ("vbroadcast", addr, tmp_scalar))
+            return addr
 
-        broadcast_const(v_zero, 0)
-        broadcast_const(v_one, 1)
-        broadcast_const(v_two, 2)
+        v_one = broadcast_const("v_one", 1)
+        v_two = broadcast_const("v_two", 2)
+        v_n_nodes = broadcast_const("v_n_nodes", n_nodes)
 
-        # Hash constants
-        # We need a map of value -> vector_addr for hash constants
+        v_forest_base = self.alloc_scratch("v_forest_base", VLEN)
+        self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
+
+        # Hash constants. The original 6-stage mix can be collapsed into:
+        # - multiply_add for additive/shift-add stages
+        # - xor/shift/xor for xor stages
         hash_consts = {}
-        for _, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            for val in [val1, val3]:
-                if val not in hash_consts:
-                    addr = self.alloc_scratch(f"hash_k_{val}", VLEN)
-                    broadcast_const(addr, val)
-                    hash_consts[val] = addr
+        for val in [
+            0x7ED55D16,
+            0xC761C23C,
+            0x165667B1,
+            0xD3A2646C,
+            0xFD7046C5,
+            0xB55A4F09,
+            0x1001,  # 4097 = 1 + 2^12
+            0x21,  # 33 = 1 + 2^5
+            0x9,  # 9 = 1 + 2^3
+            0x13,  # 19
+            0x10,  # 16
+        ]:
+            if val not in hash_consts:
+                hash_consts[val] = broadcast_const(f"hash_k_{val}", val)
+
+        v_shift9 = hash_consts[0x9]
+        v_shift19 = hash_consts[0x13]
+        v_shift16 = hash_consts[0x10]
 
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting loop"))
 
-        # --- Vector Allocation ---
-        UNROLL = 16  # Optimal balance
-        
-        # Helper to alloc array of vectors
+        UNROLL = 16
+
         def alloc_vec_array(name, count):
             return [self.alloc_scratch(f"{name}_{i}", VLEN) for i in range(count)]
 
         v_idx = alloc_vec_array("v_idx", UNROLL)
         v_val = alloc_vec_array("v_val", UNROLL)
-        t_addrs = alloc_vec_array("t_addrs", UNROLL)  # Also used as v_node_val
-        
-        # Temps for math
+        v_node = alloc_vec_array("v_node", UNROLL)
         v_tmp1 = alloc_vec_array("v_tmp1", UNROLL)
         v_tmp2 = alloc_vec_array("v_tmp2", UNROLL)
-        
-        # Constants/Broadcasts shared
-        v_forest_base = self.alloc_scratch("v_forest_base", VLEN)
-        v_n_nodes = self.alloc_scratch("v_n_nodes", VLEN)
-        
-        # Scalar for address calc - reused? 
-        # addr_reg used for "alu + load".
-        # alu writes addr_reg. load reads addr_reg.
-        # If we share addr_reg, `alu(u=1)` might overwrite `addr_reg` before `load(u=0)` uses it?
-        # Scheduler checks RAW.
-        # If shared:
-        # 1. `alu(addr_reg, ...)` (u=0)
-        # 2. `load(..., addr_reg)` (u=0) -- ok
-        # 3. `alu(addr_reg, ...)` (u=1) -- RAW on 2 (reads addr_reg? no load reads it). WAW on 1.
-        #    If WAW check exists, it flushes 3.
-        # So sharing `addr_reg` prevents interleaving of address calculations.
-        # We should use separate addr registers or just allocated temps.
-        # `alloc_scratch` inside loop matches `alloc_scratch` outside loop logic?
-        # Just allocate an array of scalars too.
         addr_regs = [self.alloc_scratch(f"addr_reg_{i}", 1) for i in range(UNROLL)]
 
-        # Load broadcast constants valid for whole function
-        self.add("valu", ("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
-
-        # Forest base is already in scratch, just broadcast it
-        self.add("valu", ("vbroadcast", v_forest_base, self.scratch["forest_values_p"]))
-
-        # We process 'batch_size' items.
         step_size = VLEN * UNROLL
-        ROUND_FUSION = 16  # Process all 16 rounds together
-        
-        for r_start in range(0, rounds, ROUND_FUSION):
-            rounds_this_group = min(ROUND_FUSION, rounds - r_start)
-            
-            for b_start in range(0, batch_size, step_size):
-                
-                # State for each unroll lane
-                batch_res = []
 
-                # --- 1. Init & Loads ---
-                for u in range(UNROLL):
-                    current_batch_idx = b_start + u * VLEN
-                    if current_batch_idx >= batch_size: 
-                        batch_res.append(None)
-                        continue
-                    
-                    b_start_k = self.scratch_const(current_batch_idx, f"k_{current_batch_idx}")
-                    
-                    res = {
-                        "idx_k": current_batch_idx,
-                        "v_idx": v_idx[u],
-                        "v_val": v_val[u],
-                        "v_node_val": t_addrs[u],  # Reuse t_addrs
-                        "t_addrs": t_addrs[u],
-                        "v_tmp1": v_tmp1[u],
-                        "v_tmp2": v_tmp2[u],
-                        "addr_reg": addr_regs[u],
-                        "b_start_k": b_start_k,
-                    }
-                    batch_res.append(res)
-                    
-                    # Load Indices
-                    self.add("alu", ("+", res["addr_reg"], self.scratch["inp_indices_p"], b_start_k))
-                    self.add("load", ("vload", res["v_idx"], res["addr_reg"]))
+        # Emit the hot loop in a stage-major order so the scheduler can pack
+        # independent lanes into the same bundle.
+        for b_start in range(0, batch_size, step_size):
+            batch_res = []
+            for u in range(UNROLL):
+                current_batch_idx = b_start + u * VLEN
+                if current_batch_idx >= batch_size:
+                    batch_res.append(None)
+                    continue
 
-                    # Load Values
-                    self.add("alu", ("+", res["addr_reg"], self.scratch["inp_values_p"], b_start_k))
-                    self.add("load", ("vload", res["v_val"], res["addr_reg"]))
+                b_start_k = self.scratch_const(current_batch_idx, f"k_{current_batch_idx}")
+                res = {
+                    "v_idx": v_idx[u],
+                    "v_val": v_val[u],
+                    "v_node": v_node[u],
+                    "v_tmp1": v_tmp1[u],
+                    "v_tmp2": v_tmp2[u],
+                    "addr_reg": addr_regs[u],
+                    "b_start_k": b_start_k,
+                }
+                batch_res.append(res)
 
-                # Pipeline structure: issue loads early, do other work, then use loaded data
-                # Round 0: gather
+                self.add("alu", ("+", res["addr_reg"], self.scratch["inp_indices_p"], b_start_k))
+                self.add("load", ("vload", res["v_idx"], res["addr_reg"]))
+
+                self.add("alu", ("+", res["addr_reg"], self.scratch["inp_values_p"], b_start_k))
+                self.add("load", ("vload", res["v_val"], res["addr_reg"]))
+
+            for r in range(rounds):
+                # Load all current node values.
                 for u in range(UNROLL):
                     res = batch_res[u]
-                    if res is None: continue
-                    self.add("valu", ("+", res["t_addrs"], v_forest_base, res["v_idx"]))
+                    if res is None:
+                        continue
+                    self.add("valu", ("+", res["v_tmp1"], v_forest_base, res["v_idx"]))
                 for i in range(VLEN):
                     for u in range(UNROLL):
                         res = batch_res[u]
-                        if res is None: continue
-                        self.add("load", ("load", res["v_node_val"] + i, res["t_addrs"] + i))
-                
-                for r_offset in range(rounds_this_group):
-                    # Process hash and update
-                    # XOR
-                    for u in range(UNROLL):
-                        res = batch_res[u]
-                        if res is None: continue
-                        self.add("valu", ("^", res["v_val"], res["v_val"], res["v_node_val"]))
-                    
-                    # Hash stage 0 (op1, op3 independent)
-                    op1, val1, op2, op3, val3 = HASH_STAGES[0]
-                    k1 = hash_consts[val1]
-                    k3 = hash_consts[val3]
-                    for u in range(UNROLL):
-                        res = batch_res[u]
-                        if res is None: continue
-                        self.add("valu", (op1, res["v_tmp1"], res["v_val"], k1))
-                        self.add("valu", (op3, res["v_tmp2"], res["v_val"], k3))
-                    
-                    # Start next round's address calculation and loads (if not last round)
-                    # This happens BEFORE we finish hash, allowing overlap
-                    if r_offset < rounds_this_group - 1:
-                        # Need to compute new addresses based on CURRENT idx (before update)
-                        # But we can't - we need the hash result to update idx first
-                        pass
-                    
-                    # Finish hash stage 0
-                    for u in range(UNROLL):
-                        res = batch_res[u]
-                        if res is None: continue
-                        self.add("valu", (op2, res["v_val"], res["v_tmp1"], res["v_tmp2"]))
-                    
-                    # Hash stages 1-5
-                    for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES[1:], 1):
-                        k1 = hash_consts[val1]
-                        k3 = hash_consts[val3]
-                        for u in range(UNROLL):
-                            res = batch_res[u]
-                            if res is None: continue
-                            self.add("valu", (op1, res["v_tmp1"], res["v_val"], k1))
-                            self.add("valu", (op3, res["v_tmp2"], res["v_val"], k3))
-                        for u in range(UNROLL):
-                            res = batch_res[u]
-                            if res is None: continue
-                            self.add("valu", (op2, res["v_val"], res["v_tmp1"], res["v_tmp2"]))
-                    
-                    # Update idx
-                    for u in range(UNROLL):
-                        res = batch_res[u]
-                        if res is None: continue
-                        self.add("valu", ("&", res["v_tmp1"], res["v_val"], v_one))
-                        self.add("valu", ("+", res["v_tmp1"], res["v_tmp1"], v_one))
-                        self.add("valu", ("multiply_add", res["v_idx"], res["v_idx"], v_two, res["v_tmp1"]))
-                        self.add("valu", ("<", res["v_tmp1"], res["v_idx"], v_n_nodes))
-                        self.add("valu", ("*", res["v_idx"], res["v_idx"], res["v_tmp1"]))
-                    
-                    # Gather for next round (if not last)
-                    if r_offset < rounds_this_group - 1:
-                        for u in range(UNROLL):
-                            res = batch_res[u]
-                            if res is None: continue
-                            self.add("valu", ("+", res["t_addrs"], v_forest_base, res["v_idx"]))
-                        for i in range(VLEN):
-                            for u in range(UNROLL):
-                                res = batch_res[u]
-                                if res is None: continue
-                                self.add("load", ("load", res["v_node_val"] + i, res["t_addrs"] + i))
+                        if res is None:
+                            continue
+                        self.add("load", ("load", res["v_node"] + i, res["v_tmp1"] + i))
 
-                # Store after all fused rounds
+                # Hash stage 0:
+                #   a = (a + c0) + (a << 12)
+                #   => multiply_add(a, 4097, c0)
+                k0 = hash_consts[0x7ED55D16]
+                k4097 = hash_consts[0x1001]
                 for u in range(UNROLL):
                     res = batch_res[u]
-                    if res is None: continue
-                    self.add("alu", ("+", res["addr_reg"], self.scratch["inp_indices_p"], res["b_start_k"]))
-                    self.add("store", ("vstore", res["addr_reg"], res["v_idx"]))
-                    self.add("alu", ("+", res["addr_reg"], self.scratch["inp_values_p"], res["b_start_k"]))
-                    self.add("store", ("vstore", res["addr_reg"], res["v_val"]))
+                    if res is None:
+                        continue
+                    self.add("valu", ("^", res["v_val"], res["v_val"], res["v_node"]))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("multiply_add", res["v_val"], res["v_val"], k4097, k0))
+
+                # Hash stage 1:
+                k1 = hash_consts[0xC761C23C]
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("^", res["v_tmp1"], res["v_val"], k1))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", (">>", res["v_tmp2"], res["v_val"], v_shift19))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("^", res["v_val"], res["v_tmp1"], res["v_tmp2"]))
+
+                # Hash stage 2:
+                k2 = hash_consts[0x165667B1]
+                k33 = hash_consts[0x21]
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("multiply_add", res["v_val"], res["v_val"], k33, k2))
+
+                # Hash stage 3:
+                k3 = hash_consts[0xD3A2646C]
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("+", res["v_tmp1"], res["v_val"], k3))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("<<", res["v_tmp2"], res["v_val"], v_shift9))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("^", res["v_val"], res["v_tmp1"], res["v_tmp2"]))
+
+                # Hash stage 4:
+                k4 = hash_consts[0xFD7046C5]
+                k9 = hash_consts[0x9]
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("multiply_add", res["v_val"], res["v_val"], k9, k4))
+
+                # Hash stage 5:
+                k5 = hash_consts[0xB55A4F09]
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("^", res["v_tmp1"], res["v_val"], k5))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", (">>", res["v_tmp2"], res["v_val"], v_shift16))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("^", res["v_val"], res["v_tmp1"], res["v_tmp2"]))
+
+                # Child index update:
+                # idx = 2 * idx + (1 if hash is even else 2)
+                #     = (2 * idx + 1) + (hash & 1)
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("&", res["v_tmp1"], res["v_val"], v_one))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("multiply_add", res["v_idx"], res["v_idx"], v_two, v_one))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("+", res["v_idx"], res["v_idx"], res["v_tmp1"]))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("<", res["v_tmp1"], res["v_idx"], v_n_nodes))
+                for u in range(UNROLL):
+                    res = batch_res[u]
+                    if res is None:
+                        continue
+                    self.add("valu", ("*", res["v_idx"], res["v_idx"], res["v_tmp1"]))
+
+                if r < rounds - 1:
+                    for u in range(UNROLL):
+                        res = batch_res[u]
+                        if res is None:
+                            continue
+                        self.add("valu", ("+", res["v_tmp1"], v_forest_base, res["v_idx"]))
+                    for i in range(VLEN):
+                        for u in range(UNROLL):
+                            res = batch_res[u]
+                            if res is None:
+                                continue
+                            self.add("load", ("load", res["v_node"] + i, res["v_tmp1"] + i))
+
+            # Write the final state back to the original input region.
+            for u in range(UNROLL):
+                res = batch_res[u]
+                if res is None:
+                    continue
+                self.add("alu", ("+", res["addr_reg"], self.scratch["inp_indices_p"], res["b_start_k"]))
+                self.add("store", ("vstore", res["addr_reg"], res["v_idx"]))
+                self.add("alu", ("+", res["addr_reg"], self.scratch["inp_values_p"], res["b_start_k"]))
+                self.add("store", ("vstore", res["addr_reg"], res["v_val"]))
 
         self.scheduler.flush()
         # self.instrs is populated
