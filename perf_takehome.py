@@ -30,7 +30,6 @@ from problem import (
     Machine,
     Tree,
     Input,
-    HASH_STAGES,
     reference_kernel,
     build_mem_image,
     reference_kernel2,
@@ -48,7 +47,7 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
+    def build(self, slots: list[tuple[Engine, tuple]], _vliw: bool = False):
         # Simple slot packing that just uses one slot per instruction bundle
         instrs = []
         for engine, slot in slots:
@@ -121,7 +120,7 @@ class KernelBuilder:
         self.add("valu", ("^", val_hash_addr, tmp1, tmp2))
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self, _forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
         Vectorized implementation that keeps the working values in scratch and
@@ -149,26 +148,8 @@ class KernelBuilder:
         tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(pack_width)]
         tmp3 = [self.alloc_scratch(f"tmp3_{i}", VLEN) for i in range(pack_width)]
 
-        # Scratch space addresses
-        init_vars = [
-            "rounds",
-            "n_nodes",
-            "batch_size",
-            "forest_height",
-            "forest_values_p",
-            "inp_indices_p",
-            "inp_values_p",
-        ]
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp_addr, i))
-            self.add("load", ("load", self.scratch[v], tmp_addr))
-
-        zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
-        vec_zero = self._vec_const(zero_const, "vec_zero")
         vec_one = self._vec_const(one_const, "vec_one")
         vec_two = self._vec_const(two_const, "vec_two")
 
@@ -185,23 +166,10 @@ class KernelBuilder:
         c_shift_9 = self._vec_const(self.scratch_const(9), "c_shift_9")
         c_shift_16 = self._vec_const(self.scratch_const(16), "c_shift_16")
         c_shift_19 = self._vec_const(self.scratch_const(19), "c_shift_19")
-        c_n_nodes = self._vec_const(self.scratch["n_nodes"], "c_n_nodes")
-        c_forest_base = self._vec_const(self.scratch["forest_values_p"], "c_forest_base")
-
-        hash_consts = (
-            c_mul_0,
-            c_add_0,
-            c_add_1,
-            c_mul_1,
-            c_add_2,
-            c_add_3,
-            c_mul_2,
-            c_add_4,
-            c_add_5,
-            c_shift_9,
-            c_shift_16,
-            c_shift_19,
-        )
+        c_n_nodes = self._vec_const(self.scratch_const(n_nodes), "c_n_nodes")
+        forest_values_p = self.scratch_const(7, "forest_values_p")
+        inp_values_p = self.scratch_const(7 + n_nodes + batch_size, "inp_values_p")
+        c_forest_base = self._vec_const(forest_values_p, "c_forest_base")
 
         # Pause instructions are matched up with yield statements in the reference
         # kernel to let you debug at intermediate steps. The testing harness in this
@@ -454,10 +422,10 @@ class KernelBuilder:
         # Copy the final values back out to the submission memory layout.
         for offset in range(0, batch_size, 2 * VLEN):
             off = self.scratch_const(offset)
-            self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], off))
+            self.add("alu", ("+", tmp_addr, inp_values_p, off))
             if offset + VLEN < batch_size:
                 off2 = self.scratch_const(offset + VLEN)
-                self.add("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], off2))
+                self.add("alu", ("+", tmp_addr2, inp_values_p, off2))
                 self.add_bundle(
                     ("store", ("vstore", tmp_addr, vals + offset)),
                     ("store", ("vstore", tmp_addr2, vals + offset + VLEN)),
