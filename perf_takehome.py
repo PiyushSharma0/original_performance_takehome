@@ -136,12 +136,18 @@ class KernelBuilder:
         tmp_addr = self.alloc_scratch("tmp_addr")
         tmp_addr2 = self.alloc_scratch("tmp_addr2")
 
-        # Vector temporaries.
-        node_addr = self.alloc_scratch("node_addr", VLEN)
-        node_vals = self.alloc_scratch("node_vals", VLEN)
-        tmp1 = self.alloc_scratch("tmp1", VLEN)
-        tmp2 = self.alloc_scratch("tmp2", VLEN)
-        tmp3 = self.alloc_scratch("tmp3", VLEN)
+        # Vector temporaries. We keep several chunks in flight so the valu
+        # engine can be filled across independent chunks in the same round.
+        pack_width = 6
+        node_addr = [
+            self.alloc_scratch(f"node_addr_{i}", VLEN) for i in range(pack_width)
+        ]
+        node_vals = [
+            self.alloc_scratch(f"node_vals_{i}", VLEN) for i in range(pack_width)
+        ]
+        tmp1 = [self.alloc_scratch(f"tmp1_{i}", VLEN) for i in range(pack_width)]
+        tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(pack_width)]
+        tmp3 = [self.alloc_scratch(f"tmp3_{i}", VLEN) for i in range(pack_width)]
 
         # Scratch space addresses
         init_vars = [
@@ -156,8 +162,8 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", tmp1, i))
-            self.add("load", ("load", self.scratch[v], tmp1))
+            self.add("load", ("const", tmp_addr, i))
+            self.add("load", ("load", self.scratch[v], tmp_addr))
 
         zero_const = self.scratch_const(0)
         one_const = self.scratch_const(1)
@@ -220,27 +226,230 @@ class KernelBuilder:
         # The indices start at zero for every sample.
         # Scratch is zero-initialized, so we can keep idxs as-is.
 
-        # Process the rounds in 8-wide chunks.
+        # Process the rounds in chunk groups so independent chunks can be
+        # bundled together across the 6-slot valu engine.
         for _round in range(rounds):
-            for offset in range(0, batch_size, VLEN):
-                # node_addr = forest_values_p + idxs
-                self.add("valu", ("+", node_addr, c_forest_base, idxs + offset))
-                for lane in range(0, VLEN, 2):
-                    self.add_bundle(
-                        ("load", ("load_offset", node_vals, node_addr, lane)),
-                        ("load", ("load_offset", node_vals, node_addr, lane + 1)),
-                    )
-                # vals ^= node_vals
-                self.add("valu", ("^", vals + offset, vals + offset, node_vals))
-                # Hash in-place.
-                self.build_hash_vec(vals + offset, tmp1, tmp2, hash_consts)
-                # next_idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.add("valu", ("&", tmp1, vals + offset, vec_one))
-                self.add("valu", ("+", tmp3, tmp1, vec_one))
-                self.add("valu", ("multiply_add", idxs + offset, idxs + offset, vec_two, tmp3))
-                # wrap to zero if the next index is out of bounds
-                self.add("valu", ("<", tmp1, idxs + offset, c_n_nodes))
-                self.add("flow", ("vselect", idxs + offset, tmp1, idxs + offset, vec_zero))
+            for base in range(0, batch_size, pack_width * VLEN):
+                active = min(pack_width, (batch_size - base) // VLEN)
+
+                # Compute node addresses for all active chunks.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("+", node_addr[chunk], c_forest_base, idxs + base + chunk * VLEN)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Load node values for every active chunk. Two scalar loads fit in
+                # each bundle, so we pair lane offsets.
+                for chunk in range(active):
+                    for lane in range(0, VLEN, 2):
+                        self.add_bundle(
+                            (
+                                "load",
+                                ("load_offset", node_vals[chunk], node_addr[chunk], lane),
+                            ),
+                            (
+                                "load",
+                                ("load_offset", node_vals[chunk], node_addr[chunk], lane + 1),
+                            ),
+                        )
+
+                # XOR the node values into the working values.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (
+                                "^",
+                                vals + base + chunk * VLEN,
+                                vals + base + chunk * VLEN,
+                                node_vals[chunk],
+                            )
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Hash stage 0.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (
+                                "multiply_add",
+                                vals + base + chunk * VLEN,
+                                vals + base + chunk * VLEN,
+                                c_mul_0,
+                                c_add_0,
+                            )
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Hash stage 1.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("^", tmp1[chunk], vals + base + chunk * VLEN, c_add_1)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (">>", tmp2[chunk], vals + base + chunk * VLEN, c_shift_19)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("^", vals + base + chunk * VLEN, tmp1[chunk], tmp2[chunk])
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Hash stage 2.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (
+                                "multiply_add",
+                                vals + base + chunk * VLEN,
+                                vals + base + chunk * VLEN,
+                                c_mul_1,
+                                c_add_2,
+                            )
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Hash stage 3.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("+", tmp1[chunk], vals + base + chunk * VLEN, c_add_3)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("<<", tmp2[chunk], vals + base + chunk * VLEN, c_shift_9)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("^", vals + base + chunk * VLEN, tmp1[chunk], tmp2[chunk])
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Hash stage 4.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (
+                                "multiply_add",
+                                vals + base + chunk * VLEN,
+                                vals + base + chunk * VLEN,
+                                c_mul_2,
+                                c_add_4,
+                            )
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Hash stage 5.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("^", tmp1[chunk], vals + base + chunk * VLEN, c_add_5)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (">>", tmp2[chunk], vals + base + chunk * VLEN, c_shift_16)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("^", vals + base + chunk * VLEN, tmp1[chunk], tmp2[chunk])
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+
+                # Index update.
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("&", tmp1[chunk], vals + base + chunk * VLEN, vec_one)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("+", tmp3[chunk], tmp1[chunk], vec_one)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (
+                                "multiply_add",
+                                idxs + base + chunk * VLEN,
+                                idxs + base + chunk * VLEN,
+                                vec_two,
+                                tmp3[chunk],
+                            )
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            ("<", tmp1[chunk], idxs + base + chunk * VLEN, c_n_nodes)
+                            for chunk in range(active)
+                        ]
+                    }
+                )
+                self.instrs.append(
+                    {
+                        "valu": [
+                            (
+                                "*",
+                                idxs + base + chunk * VLEN,
+                                idxs + base + chunk * VLEN,
+                                tmp1[chunk],
+                            )
+                            for chunk in range(active)
+                        ]
+                    }
+                )
 
         # Copy the final values back out to the submission memory layout.
         for offset in range(0, batch_size, 2 * VLEN):
