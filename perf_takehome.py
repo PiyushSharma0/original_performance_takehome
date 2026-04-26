@@ -134,6 +134,7 @@ class KernelBuilder:
 
         # Scalar temporaries.
         tmp_addr = self.alloc_scratch("tmp_addr")
+        tmp_addr2 = self.alloc_scratch("tmp_addr2")
 
         # Vector temporaries.
         node_addr = self.alloc_scratch("node_addr", VLEN)
@@ -203,10 +204,18 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         # Load the initial values into scratch.
-        for offset in range(0, batch_size, VLEN):
+        for offset in range(0, batch_size, 2 * VLEN):
             off = self.scratch_const(offset)
             self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], off))
-            self.add("load", ("vload", vals + offset, tmp_addr))
+            if offset + VLEN < batch_size:
+                off2 = self.scratch_const(offset + VLEN)
+                self.add("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], off2))
+                self.add_bundle(
+                    ("load", ("vload", vals + offset, tmp_addr)),
+                    ("load", ("vload", vals + offset + VLEN, tmp_addr2)),
+                )
+            else:
+                self.add("load", ("vload", vals + offset, tmp_addr))
 
         # The indices start at zero for every sample.
         # Scratch is zero-initialized, so we can keep idxs as-is.
@@ -226,20 +235,26 @@ class KernelBuilder:
                 # Hash in-place.
                 self.build_hash_vec(vals + offset, tmp1, tmp2, hash_consts)
                 # next_idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.add("valu", ("%", tmp1, vals + offset, vec_two))
-                self.add("valu", ("==", tmp1, tmp1, vec_zero))
-                self.add("flow", ("vselect", tmp3, tmp1, vec_one, vec_two))
-                self.add("valu", ("*", idxs + offset, idxs + offset, vec_two))
-                self.add("valu", ("+", idxs + offset, idxs + offset, tmp3))
+                self.add("valu", ("&", tmp1, vals + offset, vec_one))
+                self.add("valu", ("+", tmp3, tmp1, vec_one))
+                self.add("valu", ("multiply_add", idxs + offset, idxs + offset, vec_two, tmp3))
                 # wrap to zero if the next index is out of bounds
                 self.add("valu", ("<", tmp1, idxs + offset, c_n_nodes))
                 self.add("flow", ("vselect", idxs + offset, tmp1, idxs + offset, vec_zero))
 
         # Copy the final values back out to the submission memory layout.
-        for offset in range(0, batch_size, VLEN):
+        for offset in range(0, batch_size, 2 * VLEN):
             off = self.scratch_const(offset)
             self.add("alu", ("+", tmp_addr, self.scratch["inp_values_p"], off))
-            self.add("store", ("vstore", tmp_addr, vals + offset))
+            if offset + VLEN < batch_size:
+                off2 = self.scratch_const(offset + VLEN)
+                self.add("alu", ("+", tmp_addr2, self.scratch["inp_values_p"], off2))
+                self.add_bundle(
+                    ("store", ("vstore", tmp_addr, vals + offset)),
+                    ("store", ("vstore", tmp_addr2, vals + offset + VLEN)),
+                )
+            else:
+                self.add("store", ("vstore", tmp_addr, vals + offset))
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
