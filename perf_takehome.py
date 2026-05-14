@@ -104,9 +104,10 @@ class KernelBuilder:
         # Vector temporaries. We keep several chunks in flight so the valu
         # engine can be filled across independent chunks in the same round.
         pack_width = 6
+        generic_pack_width = 4
         node_vals = [
             [self.alloc_scratch(f"node_vals_{buf}_{i}", VLEN) for i in range(pack_width)]
-            for buf in range(2)
+            for buf in range(8)
         ]
         shallow_vecs = [
             self.alloc_scratch(f"shallow_vec_{i}", VLEN) for i in range(6)
@@ -115,6 +116,9 @@ class KernelBuilder:
         tmp1 = [self.alloc_scratch(f"tmp1_{i}", VLEN) for i in range(pack_width)]
         tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(pack_width)]
         tmp3 = [self.alloc_scratch(f"tmp3_{i}", VLEN) for i in range(pack_width)]
+        idx_tmp = [
+            self.alloc_scratch(f"idx_tmp_{i}", VLEN) for i in range(pack_width)
+        ]
 
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
@@ -137,15 +141,16 @@ class KernelBuilder:
         c_mul_0 = self._vec_const(self.scratch_const(4097), "c_mul_0")
         c_mul_1 = self._vec_const(self.scratch_const(33), "c_mul_1")
         c_9 = self._vec_const(self.scratch_const(9), "c_9")
-        c_shift_16 = self._vec_const(self.scratch_const(16), "c_shift_16")
+        scalar_16 = self.scratch_const(16)
+        c_shift_16 = self._vec_const(scalar_16, "c_shift_16")
         c_shift_19 = self._vec_const(self.scratch_const(19), "c_shift_19")
         forest_values_p = self.scratch_const(7, "forest_values_p")
         inp_values_p = self.scratch_const(7 + n_nodes + batch_size, "inp_values_p")
         c_forest_base = self._vec_const(forest_values_p, "c_forest_base")
-        c_update_bias = self._vec_const(
-            self.scratch_const(1 - 7), "c_update_bias"
-        )
-        vec_addr_8 = self._vec_const(self.scratch_const(8), "vec_addr_8")
+        update_bias_const = self.scratch_const(1 - 7)
+        c_update_bias = self._vec_const(update_bias_const, "c_update_bias")
+        scalar_addr_8 = self.scratch_const(8)
+        vec_addr_8 = self._vec_const(scalar_addr_8, "vec_addr_8")
         vec_addr_10 = self._vec_const(self.scratch_const(10), "vec_addr_10")
         vec_addr_11 = self._vec_const(self.scratch_const(11), "vec_addr_11")
         vec_addr_12 = self._vec_const(self.scratch_const(12), "vec_addr_12")
@@ -165,24 +170,91 @@ class KernelBuilder:
         self.add("flow", ("pause",))
 
         # Load the initial values into scratch.
+        self.add_bundle(
+            ("alu", ("+", tmp_addr, inp_values_p, zero_const)),
+            ("alu", ("+", tmp_addr2, inp_values_p, self.scratch_const(VLEN))),
+        )
         for offset in range(0, batch_size, 2 * VLEN):
-            off = self.scratch_const(offset)
             if offset + VLEN < batch_size:
-                off2 = self.scratch_const(offset + VLEN)
-                self.add_bundle(
-                    ("alu", ("+", tmp_addr, inp_values_p, off)),
-                    ("alu", ("+", tmp_addr2, inp_values_p, off2)),
-                )
-                self.add_bundle(
-                    ("load", ("vload", vals + offset, tmp_addr)),
-                    ("load", ("vload", vals + offset + VLEN, tmp_addr2)),
-                )
+                instr = {
+                    "load": [
+                        ("vload", vals + offset, tmp_addr),
+                        ("vload", vals + offset + VLEN, tmp_addr2),
+                    ],
+                    "alu": [
+                        ("+", tmp_addr, tmp_addr, scalar_16),
+                        ("+", tmp_addr2, tmp_addr2, scalar_16),
+                    ],
+                }
+                self.instrs.append(instr)
             else:
-                self.add("alu", ("+", tmp_addr, inp_values_p, off))
                 self.add("load", ("vload", vals + offset, tmp_addr))
+                self.add_bundle(
+                    ("alu", ("+", tmp_addr, tmp_addr, scalar_16)),
+                    ("alu", ("+", tmp_addr2, tmp_addr2, scalar_16)),
+                )
+        pending_alu = []
+
+        def append_instr(instr):
+            if pending_alu and "alu" not in instr:
+                instr = dict(instr)
+                instr["alu"] = pending_alu.pop(0)
+            self.instrs.append(instr)
+
+        def alu_batches(slots):
+            return [slots[i : i + 12] for i in range(0, len(slots), 12)]
+
+        def queue_index_update(base, active, is_root):
+            bit_slots = []
+            for chunk in range(active):
+                for lane in range(VLEN):
+                    bit_slots.append(
+                        (
+                            "&",
+                            idx_tmp[chunk] + lane,
+                            vals + base + chunk * VLEN + lane,
+                            one_const,
+                        )
+                    )
+            for batch in alu_batches(bit_slots):
+                pending_alu.append(batch)
+
+            if is_root:
+                root_slots = []
+                for chunk in range(active):
+                    for lane in range(VLEN):
+                        root_slots.append(
+                            (
+                                "+",
+                                idxs + base + chunk * VLEN + lane,
+                                idx_tmp[chunk] + lane,
+                                scalar_addr_8,
+                            )
+                        )
+                for batch in alu_batches(root_slots):
+                    pending_alu.append(batch)
+                return
+
+            bias_slots = []
+            mul_slots = []
+            add_slots = []
+            for chunk in range(active):
+                for lane in range(VLEN):
+                    idx_addr = idxs + base + chunk * VLEN + lane
+                    tmp_addr_i = idx_tmp[chunk] + lane
+                    bias_slots.append(("+", tmp_addr_i, tmp_addr_i, update_bias_const))
+                    mul_slots.append(("*", idx_addr, idx_addr, two_const))
+                    add_slots.append(("+", idx_addr, idx_addr, tmp_addr_i))
+            for slots in (bias_slots, mul_slots, add_slots):
+                for batch in alu_batches(slots):
+                    pending_alu.append(batch)
+
+        def flush_pending_alu():
+            while pending_alu:
+                append_instr({})
 
         def valu_instr(slots):
-            self.instrs.append({"valu": slots})
+            append_instr({"valu": slots})
 
         def emit_load_hash(load_instrs, hash_instrs):
             for i in range(max(len(load_instrs), len(hash_instrs))):
@@ -191,7 +263,7 @@ class KernelBuilder:
                     instr.update(load_instrs[i])
                 if i < len(hash_instrs):
                     instr.update(hash_instrs[i])
-                self.instrs.append(instr)
+                append_instr(instr)
 
         def generic_load_instrs(base, active, buf):
             loads = []
@@ -217,7 +289,13 @@ class KernelBuilder:
                     )
             return loads
 
-        def hash_instrs(base, active, node_source, is_root_round, is_leaf_round):
+        def hash_instrs(
+            base,
+            active,
+            node_source,
+            is_root_round,
+            is_leaf_round,
+        ):
             node_operand = lambda chunk: root_vec if is_root_round else node_source[chunk]
             instrs = [
                 {
@@ -322,56 +400,26 @@ class KernelBuilder:
                     ]
                 },
             ]
-            if is_leaf_round:
-                instrs.append(
-                    {
-                        "valu": [
-                            (
-                                "multiply_add",
-                                idxs + base + chunk * VLEN,
-                                idxs + base + chunk * VLEN,
-                                vec_zero,
-                                c_forest_base,
-                            )
-                            for chunk in range(active)
-                        ]
-                    }
-                )
-            else:
-                instrs.extend(
-                    [
-                        {
-                            "valu": [
-                                ("&", tmp1[chunk], vals + base + chunk * VLEN, vec_one)
-                                for chunk in range(active)
-                            ]
-                        },
-                        {
-                            "valu": [
-                                ("+", tmp3[chunk], tmp1[chunk], c_update_bias)
-                                for chunk in range(active)
-                            ]
-                        },
-                        {
-                            "valu": [
-                                (
-                                    "multiply_add",
-                                    idxs + base + chunk * VLEN,
-                                    idxs + base + chunk * VLEN,
-                                    vec_two,
-                                    tmp3[chunk],
-                                )
-                                for chunk in range(active)
-                            ]
-                        },
-                    ]
-                )
             return instrs
 
-        def emit_hash(base, active, node_source, is_root_round, is_leaf_round):
-            self.instrs.extend(
-                hash_instrs(base, active, node_source, is_root_round, is_leaf_round)
-            )
+        def emit_hash(
+            base,
+            active,
+            node_source,
+            is_root_round,
+            is_leaf_round,
+            skip_index_update=False,
+        ):
+            for instr in hash_instrs(
+                base,
+                active,
+                node_source,
+                is_root_round,
+                is_leaf_round,
+            ):
+                append_instr(instr)
+            if not skip_index_update and not is_leaf_round:
+                queue_index_update(base, active, is_root_round)
 
         def emit_depth1_lookup(base, active, out):
             valu_instr(
@@ -431,70 +479,230 @@ class KernelBuilder:
 
         # Process the rounds in chunk groups so independent chunks can be
         # bundled together across the 6-slot valu engine.
+        preloaded_generic = []
         for _round in range(rounds):
             depth = _round % (forest_height + 1)
             is_leaf_round = depth == forest_height
             is_root_round = depth == 0
             is_depth1_round = depth == 1
             is_depth2_round = depth == 2
+            is_final_round = _round == rounds - 1
+            next_depth = (_round + 1) % (forest_height + 1)
+            next_is_generic = (
+                _round + 1 < rounds
+                and next_depth != 0
+                and next_depth != 1
+                and next_depth != 2
+            )
+
+            if not is_root_round and not is_depth1_round and not is_depth2_round:
+                groups = [
+                    (base, min(generic_pack_width, (batch_size - base) // VLEN))
+                    for base in range(0, batch_size, generic_pack_width * VLEN)
+                ]
+                source_bufs = [None] * len(groups)
+                if not preloaded_generic:
+                    first_base, first_active = groups[0]
+                    emit_load_hash(generic_load_instrs(first_base, first_active, 0), [])
+                    preloaded_generic = [0]
+                for i, buf in enumerate(preloaded_generic):
+                    source_bufs[i] = buf
+
+                next_preloaded = 0
+                next_preloaded_bufs = []
+                n_groups = len(groups)
+                for group_i, (base, active) in enumerate(groups):
+                    source_buf = source_bufs[group_i]
+                    current_hash = hash_instrs(
+                        base,
+                        active,
+                        node_vals[source_buf],
+                        False,
+                        is_leaf_round,
+                    )
+                    load_i = len(preloaded_generic) + group_i
+                    if load_i < n_groups:
+                        load_base, load_active = groups[load_i]
+                        source_bufs[load_i] = load_i
+                        emit_load_hash(
+                            generic_load_instrs(load_base, load_active, load_i),
+                            current_hash,
+                        )
+                    elif next_is_generic:
+                        next_i = next_preloaded
+                        next_base = next_i * generic_pack_width * VLEN
+                        next_active = min(
+                            generic_pack_width, (batch_size - next_base) // VLEN
+                        )
+                        emit_load_hash(
+                            generic_load_instrs(next_base, next_active, next_i),
+                            current_hash,
+                        )
+                        next_preloaded += 1
+                        next_preloaded_bufs.append(next_i)
+                    else:
+                        for instr in current_hash:
+                            append_instr(instr)
+                    if not is_final_round and not is_leaf_round:
+                        queue_index_update(base, active, False)
+                preloaded_generic = next_preloaded_bufs
+                continue
+
             groups = [
                 (base, min(pack_width, (batch_size - base) // VLEN))
                 for base in range(0, batch_size, pack_width * VLEN)
             ]
-
-            if not is_root_round and not is_depth1_round and not is_depth2_round:
-                first_base, first_active = groups[0]
-                emit_load_hash(generic_load_instrs(first_base, first_active, 0), [])
-                for group_i, (base, active) in enumerate(groups[1:], start=1):
-                    prev_base, prev_active = groups[group_i - 1]
-                    buf = group_i % 2
-                    prev_buf = (group_i - 1) % 2
-                    emit_load_hash(
-                        generic_load_instrs(base, active, buf),
-                        hash_instrs(
-                            prev_base,
-                            prev_active,
-                            node_vals[prev_buf],
-                            False,
-                            is_leaf_round,
-                        ),
-                    )
-                last_base, last_active = groups[-1]
-                emit_hash(
-                    last_base,
-                    last_active,
-                    node_vals[(len(groups) - 1) % 2],
-                    False,
-                    is_leaf_round,
-                )
-                continue
-
-            for base, active in groups:
+            next_preloaded_bufs = []
+            for group_i, (base, active) in enumerate(groups):
                 if is_depth1_round:
                     emit_depth1_lookup(base, active, node_vals[0])
-                    emit_hash(base, active, node_vals[0], False, is_leaf_round)
+                    current_hash = hash_instrs(
+                        base,
+                        active,
+                        node_vals[0],
+                        False,
+                        is_leaf_round,
+                    )
                 elif is_depth2_round:
                     emit_depth2_lookup(base, active, node_vals[0])
-                    emit_hash(base, active, node_vals[0], False, is_leaf_round)
+                    current_hash = hash_instrs(
+                        base,
+                        active,
+                        node_vals[0],
+                        False,
+                        is_leaf_round,
+                    )
                 else:
-                    emit_hash(base, active, node_vals[0], True, is_leaf_round)
+                    current_hash = hash_instrs(
+                        base,
+                        active,
+                        node_vals[0],
+                        True,
+                        is_leaf_round,
+                    )
+                next_i = group_i - 2
+                if next_is_generic and 0 <= next_i < 4:
+                    next_base = next_i * generic_pack_width * VLEN
+                    next_active = min(
+                        generic_pack_width, (batch_size - next_base) // VLEN
+                    )
+                    next_buf = 4 + next_i
+                    emit_load_hash(
+                        generic_load_instrs(next_base, next_active, next_buf),
+                        current_hash,
+                    )
+                    next_preloaded_bufs.append(next_buf)
+                else:
+                    for instr in current_hash:
+                        append_instr(instr)
+                if not is_final_round and not is_leaf_round:
+                    queue_index_update(base, active, is_root_round)
+            preloaded_generic = next_preloaded_bufs
+
+        flush_pending_alu()
 
         # Copy the final values back out to the submission memory layout.
+        self.add_bundle(
+            ("alu", ("+", tmp_addr, inp_values_p, zero_const)),
+            ("alu", ("+", tmp_addr2, inp_values_p, self.scratch_const(VLEN))),
+        )
         for offset in range(0, batch_size, 2 * VLEN):
-            off = self.scratch_const(offset)
             if offset + VLEN < batch_size:
-                off2 = self.scratch_const(offset + VLEN)
-                self.add_bundle(
-                    ("alu", ("+", tmp_addr, inp_values_p, off)),
-                    ("alu", ("+", tmp_addr2, inp_values_p, off2)),
-                )
-                self.add_bundle(
-                    ("store", ("vstore", tmp_addr, vals + offset)),
-                    ("store", ("vstore", tmp_addr2, vals + offset + VLEN)),
+                self.instrs.append(
+                    {
+                        "store": [
+                            ("vstore", tmp_addr, vals + offset),
+                            ("vstore", tmp_addr2, vals + offset + VLEN),
+                        ],
+                        "alu": [
+                            ("+", tmp_addr, tmp_addr, scalar_16),
+                            ("+", tmp_addr2, tmp_addr2, scalar_16),
+                        ],
+                    }
                 )
             else:
-                self.add("alu", ("+", tmp_addr, inp_values_p, off))
                 self.add("store", ("vstore", tmp_addr, vals + offset))
+
+        def slot_rw(engine, slot):
+            reads = set()
+            writes = set()
+            if engine == "alu":
+                _, dest, a1, a2 = slot
+                writes.add(dest)
+                reads.update((a1, a2))
+            elif engine == "valu":
+                if slot[0] == "vbroadcast":
+                    _, dest, src = slot
+                    writes.update(range(dest, dest + VLEN))
+                    reads.add(src)
+                elif slot[0] == "multiply_add":
+                    _, dest, a, b, c = slot
+                    writes.update(range(dest, dest + VLEN))
+                    reads.update(range(a, a + VLEN))
+                    reads.update(range(b, b + VLEN))
+                    reads.update(range(c, c + VLEN))
+                else:
+                    _, dest, a1, a2 = slot
+                    writes.update(range(dest, dest + VLEN))
+                    reads.update(range(a1, a1 + VLEN))
+                    reads.update(range(a2, a2 + VLEN))
+            elif engine == "load":
+                if slot[0] == "const":
+                    _, dest, _ = slot
+                    writes.add(dest)
+                elif slot[0] == "load":
+                    _, dest, addr = slot
+                    writes.add(dest)
+                    reads.add(addr)
+                elif slot[0] == "load_offset":
+                    _, dest, addr, offset = slot
+                    writes.add(dest + offset)
+                    reads.add(addr + offset)
+                elif slot[0] == "vload":
+                    _, dest, addr = slot
+                    writes.update(range(dest, dest + VLEN))
+                    reads.add(addr)
+            return reads, writes
+
+        def instr_rw(instr):
+            reads = set()
+            writes = set()
+            for engine, slots in instr.items():
+                for slot in slots:
+                    slot_reads, slot_writes = slot_rw(engine, slot)
+                    reads.update(slot_reads)
+                    writes.update(slot_writes)
+            return reads, writes
+
+        def can_merge(first, second):
+            if any(engine in first or engine in second for engine in ("store", "flow", "debug")):
+                return False
+            limits = {"alu": 12, "valu": 6, "load": 2}
+            for engine, slots in second.items():
+                if len(first.get(engine, [])) + len(slots) > limits[engine]:
+                    return False
+            first_reads, first_writes = instr_rw(first)
+            second_reads, second_writes = instr_rw(second)
+            if first_writes & second_reads:
+                return False
+            if first_writes & second_writes:
+                return False
+            return True
+
+        changed = True
+        while changed:
+            changed = False
+            packed = []
+            for instr in self.instrs:
+                if packed and can_merge(packed[-1], instr):
+                    merged = dict(packed[-1])
+                    for engine, slots in instr.items():
+                        merged[engine] = merged.get(engine, []) + slots
+                    packed[-1] = merged
+                    changed = True
+                else:
+                    packed.append(instr)
+            self.instrs = packed
 
         # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
