@@ -123,13 +123,6 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
         zero_const = self.scratch_const(0)
-        vec_one = self._vec_const(one_const, "vec_one")
-        vec_two = self._vec_const(two_const, "vec_two")
-        vec_zero = self._vec_const(zero_const, "vec_zero")
-        vec_three = self._vec_const(self.scratch_const(3), "vec_three")
-        vec_four = self._vec_const(self.scratch_const(4), "vec_four")
-        vec_five = self._vec_const(self.scratch_const(5), "vec_five")
-        vec_six = self._vec_const(self.scratch_const(6), "vec_six")
 
         # Vector constants used in the hash.
         c_add_0 = self._vec_const(self.scratch_const(0x7ED55D16), "c_add_0")
@@ -146,9 +139,7 @@ class KernelBuilder:
         c_shift_19 = self._vec_const(self.scratch_const(19), "c_shift_19")
         forest_values_p = self.scratch_const(7, "forest_values_p")
         inp_values_p = self.scratch_const(7 + n_nodes + batch_size, "inp_values_p")
-        c_forest_base = self._vec_const(forest_values_p, "c_forest_base")
         update_bias_const = self.scratch_const(1 - 7)
-        c_update_bias = self._vec_const(update_bias_const, "c_update_bias")
         scalar_addr_8 = self.scratch_const(8)
         vec_addr_8 = self._vec_const(scalar_addr_8, "vec_addr_8")
         vec_addr_10 = self._vec_const(self.scratch_const(10), "vec_addr_10")
@@ -465,17 +456,6 @@ class KernelBuilder:
                             for chunk in range(active)
                         ]
                     )
-
-        # Keep current-node memory addresses in idxs. This avoids rebuilding
-        # forest_base + index before every generic gather.
-        for base in range(0, batch_size, pack_width * VLEN):
-            active = min(pack_width, (batch_size - base) // VLEN)
-            valu_instr(
-                [
-                    ("+", idxs + base + chunk * VLEN, c_forest_base, vec_zero)
-                    for chunk in range(active)
-                ]
-            )
 
         # Process the rounds in chunk groups so independent chunks can be
         # bundled together across the 6-slot valu engine.
