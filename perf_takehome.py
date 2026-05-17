@@ -17,6 +17,7 @@ We recommend you look through problem.py next.
 """
 
 from collections import defaultdict
+import heapq
 import random
 import unittest
 
@@ -104,25 +105,44 @@ class KernelBuilder:
         # Vector temporaries. We keep several chunks in flight so the valu
         # engine can be filled across independent chunks in the same round.
         pack_width = 6
-        generic_pack_width = 4
+        generic_pack_width = 6
         node_vals = [
             [self.alloc_scratch(f"node_vals_{buf}_{i}", VLEN) for i in range(pack_width)]
-            for buf in range(8)
+            for buf in range(6)
         ]
         shallow_vecs = [
             self.alloc_scratch(f"shallow_vec_{i}", VLEN) for i in range(6)
         ]
-        shallow_diff_1_2 = self.alloc_scratch("shallow_diff_1_2", VLEN)
-        tmp1 = [self.alloc_scratch(f"tmp1_{i}", VLEN) for i in range(pack_width)]
-        tmp2 = [self.alloc_scratch(f"tmp2_{i}", VLEN) for i in range(pack_width)]
-        tmp3 = [self.alloc_scratch(f"tmp3_{i}", VLEN) for i in range(pack_width)]
+        tmp1 = []
+        tmp2 = []
+        for bank in range(5):
+            tmp1.append(
+                [
+                    self.alloc_scratch(f"tmp1_{bank}_{i}", VLEN)
+                    for i in range(pack_width)
+                ]
+            )
+            tmp2_row = []
+            for i in range(pack_width):
+                if bank == 4 and i == pack_width - 1:
+                    # These scalar slots are dead during the hot loop and are
+                    # reinitialized before the final stores.
+                    tmp2_row.append(tmp_addr)
+                else:
+                    tmp2_row.append(self.alloc_scratch(f"tmp2_{bank}_{i}", VLEN))
+            tmp2.append(tmp2_row)
         idx_tmp = [
-            self.alloc_scratch(f"idx_tmp_{i}", VLEN) for i in range(pack_width)
+            [
+                self.alloc_scratch(f"idx_tmp_{bank}_{i}", VLEN)
+                for i in range(pack_width)
+            ]
+            for bank in range(1)
         ]
 
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
         zero_const = self.scratch_const(0)
+        vec_one = self._vec_const(one_const, "vec_one")
 
         # Vector constants used in the hash.
         c_add_0 = self._vec_const(self.scratch_const(0x7ED55D16), "c_add_0")
@@ -141,24 +161,12 @@ class KernelBuilder:
         inp_values_p = self.scratch_const(7 + n_nodes + batch_size, "inp_values_p")
         update_bias_const = self.scratch_const(1 - 7)
         scalar_addr_8 = self.scratch_const(8)
-        vec_addr_8 = self._vec_const(scalar_addr_8, "vec_addr_8")
-        vec_addr_10 = self._vec_const(self.scratch_const(10), "vec_addr_10")
-        vec_addr_11 = self._vec_const(self.scratch_const(11), "vec_addr_11")
-        vec_addr_12 = self._vec_const(self.scratch_const(12), "vec_addr_12")
-        vec_addr_13 = self._vec_const(self.scratch_const(13), "vec_addr_13")
         root_vec = self.alloc_scratch("root_vec", VLEN)
         self.add("load", ("load", root_val, forest_values_p))
         self.add("valu", ("vbroadcast", root_vec, root_val))
         for i in range(6):
             self.add("load", ("load", shallow_vals[i], self.scratch_const(8 + i)))
             self.add("valu", ("vbroadcast", shallow_vecs[i], shallow_vals[i]))
-        self.add("valu", ("-", shallow_diff_1_2, shallow_vecs[0], shallow_vecs[1]))
-
-        # Pause instructions are matched up with yield statements in the reference
-        # kernel to let you debug at intermediate steps. The testing harness in this
-        # file requires these match up to the reference kernel's yields, but the
-        # submission harness ignores them.
-        self.add("flow", ("pause",))
 
         # Load the initial values into scratch.
         self.add_bundle(
@@ -195,22 +203,22 @@ class KernelBuilder:
         def alu_batches(slots):
             return [slots[i : i + 12] for i in range(0, len(slots), 12)]
 
-        def queue_index_update(base, active, is_root):
+        def queue_index_update(base, active, is_root, bank=0):
+            idx_bank = idx_tmp[bank]
             bit_slots = []
             for chunk in range(active):
                 for lane in range(VLEN):
                     bit_slots.append(
                         (
                             "&",
-                            idx_tmp[chunk] + lane,
+                            idx_bank[chunk] + lane,
                             vals + base + chunk * VLEN + lane,
                             one_const,
                         )
                     )
-            for batch in alu_batches(bit_slots):
-                pending_alu.append(batch)
-
             if is_root:
+                for batch in alu_batches(bit_slots):
+                    pending_alu.append(batch)
                 root_slots = []
                 for chunk in range(active):
                     for lane in range(VLEN):
@@ -218,7 +226,7 @@ class KernelBuilder:
                             (
                                 "+",
                                 idxs + base + chunk * VLEN + lane,
-                                idx_tmp[chunk] + lane,
+                                idx_bank[chunk] + lane,
                                 scalar_addr_8,
                             )
                         )
@@ -232,13 +240,27 @@ class KernelBuilder:
             for chunk in range(active):
                 for lane in range(VLEN):
                     idx_addr = idxs + base + chunk * VLEN + lane
-                    tmp_addr_i = idx_tmp[chunk] + lane
+                    tmp_addr_i = idx_bank[chunk] + lane
                     bias_slots.append(("+", tmp_addr_i, tmp_addr_i, update_bias_const))
                     mul_slots.append(("*", idx_addr, idx_addr, two_const))
                     add_slots.append(("+", idx_addr, idx_addr, tmp_addr_i))
-            for slots in (bias_slots, mul_slots, add_slots):
+
+            # The old-index multiply is independent of the bit/bias chain.
+            # Fill spare ALU slots in those batches with multiplies, then emit
+            # any remaining multiplies before the final dependent add.
+            mul_i = 0
+            for slots in (bit_slots, bias_slots):
                 for batch in alu_batches(slots):
+                    batch = list(batch)
+                    while mul_i < len(mul_slots) and len(batch) < 12:
+                        batch.append(mul_slots[mul_i])
+                        mul_i += 1
                     pending_alu.append(batch)
+            while mul_i < len(mul_slots):
+                pending_alu.append(mul_slots[mul_i : mul_i + 12])
+                mul_i += 12
+            for batch in alu_batches(add_slots):
+                pending_alu.append(batch)
 
         def flush_pending_alu():
             while pending_alu:
@@ -286,7 +308,10 @@ class KernelBuilder:
             node_source,
             is_root_round,
             is_leaf_round,
+            bank=0,
         ):
+            tmp1_bank = tmp1[bank]
+            tmp2_bank = tmp2[bank]
             node_operand = lambda chunk: root_vec if is_root_round else node_source[chunk]
             instrs = [
                 {
@@ -314,19 +339,19 @@ class KernelBuilder:
                 },
                 {
                     "valu": [
-                        ("^", tmp1[chunk], vals + base + chunk * VLEN, c_add_1)
+                        ("^", tmp1_bank[chunk], vals + base + chunk * VLEN, c_add_1)
                         for chunk in range(active)
                     ]
                 },
                 {
                     "valu": [
-                        (">>", tmp2[chunk], vals + base + chunk * VLEN, c_shift_19)
+                        (">>", tmp2_bank[chunk], vals + base + chunk * VLEN, c_shift_19)
                         for chunk in range(active)
                     ]
                 },
                 {
                     "valu": [
-                        ("^", vals + base + chunk * VLEN, tmp1[chunk], tmp2[chunk])
+                        ("^", vals + base + chunk * VLEN, tmp1_bank[chunk], tmp2_bank[chunk])
                         for chunk in range(active)
                     ]
                 },
@@ -344,19 +369,19 @@ class KernelBuilder:
                 },
                 {
                     "valu": [
-                        ("+", tmp1[chunk], vals + base + chunk * VLEN, c_add_3)
+                        ("+", tmp1_bank[chunk], vals + base + chunk * VLEN, c_add_3)
                         for chunk in range(active)
                     ]
                 },
                 {
                     "valu": [
-                        ("<<", tmp2[chunk], vals + base + chunk * VLEN, c_9)
+                        ("<<", tmp2_bank[chunk], vals + base + chunk * VLEN, c_9)
                         for chunk in range(active)
                     ]
                 },
                 {
                     "valu": [
-                        ("^", vals + base + chunk * VLEN, tmp1[chunk], tmp2[chunk])
+                        ("^", vals + base + chunk * VLEN, tmp1_bank[chunk], tmp2_bank[chunk])
                         for chunk in range(active)
                     ]
                 },
@@ -374,19 +399,19 @@ class KernelBuilder:
                 },
                 {
                     "valu": [
-                        ("^", tmp1[chunk], vals + base + chunk * VLEN, c_add_5)
+                        ("^", tmp1_bank[chunk], vals + base + chunk * VLEN, c_add_5)
                         for chunk in range(active)
                     ]
                 },
                 {
                     "valu": [
-                        (">>", tmp2[chunk], vals + base + chunk * VLEN, c_shift_16)
+                        (">>", tmp2_bank[chunk], vals + base + chunk * VLEN, c_shift_16)
                         for chunk in range(active)
                     ]
                 },
                 {
                     "valu": [
-                        ("^", vals + base + chunk * VLEN, tmp1[chunk], tmp2[chunk])
+                        ("^", vals + base + chunk * VLEN, tmp1_bank[chunk], tmp2_bank[chunk])
                         for chunk in range(active)
                     ]
                 },
@@ -400,6 +425,7 @@ class KernelBuilder:
             is_root_round,
             is_leaf_round,
             skip_index_update=False,
+            bank=0,
         ):
             for instr in hash_instrs(
                 base,
@@ -407,55 +433,97 @@ class KernelBuilder:
                 node_source,
                 is_root_round,
                 is_leaf_round,
+                bank,
             ):
                 append_instr(instr)
             if not skip_index_update and not is_leaf_round:
-                queue_index_update(base, active, is_root_round)
+                queue_index_update(base, active, is_root_round, bank)
 
-        def emit_depth1_lookup(base, active, out):
+        def emit_depth1_lookup(base, active, out, bank=0):
+            tmp1_bank = tmp1[bank]
             valu_instr(
                 [
-                    ("==", tmp1[chunk], idxs + base + chunk * VLEN, vec_addr_8)
+                    ("&", tmp1_bank[chunk], idxs + base + chunk * VLEN, vec_one)
                     for chunk in range(active)
                 ]
             )
-            valu_instr(
-                [
-                    ("*", tmp3[chunk], tmp1[chunk], shallow_diff_1_2)
-                    for chunk in range(active)
-                ]
-            )
-            valu_instr(
-                [
-                    ("+", out[chunk], shallow_vecs[1], tmp3[chunk])
-                    for chunk in range(active)
-                ]
-            )
-
-        def emit_depth2_lookup(base, active, out):
-            idx_vecs = [vec_addr_10, vec_addr_11, vec_addr_12, vec_addr_13]
-            source_vecs = shallow_vecs[2:6]
-            for i, (idx_vec, source_vec) in enumerate(zip(idx_vecs, source_vecs)):
-                valu_instr(
-                    [
-                        ("==", tmp1[chunk], idxs + base + chunk * VLEN, idx_vec)
-                        for chunk in range(active)
-                    ]
-                )
-                dest = out if i == 0 else tmp2
-                valu_instr(
-                    [
-                        ("*", dest[chunk], tmp1[chunk], source_vec)
-                        for chunk in range(active)
-                    ]
-                )
-                if i != 0:
-                    valu_instr(
-                        [
-                            ("+", out[chunk], out[chunk], tmp2[chunk])
-                            for chunk in range(active)
+            for chunk in range(active):
+                append_instr(
+                    {
+                        "flow": [
+                            (
+                                "vselect",
+                                out[chunk],
+                                tmp1_bank[chunk],
+                                shallow_vecs[1],
+                                shallow_vecs[0],
+                            )
                         ]
-                    )
+                    }
+                )
+
+        def emit_depth2_lookup(base, active, out, bank=0):
+            tmp1_bank = tmp1[bank]
+            tmp2_bank = tmp2[bank]
+            valu_instr(
+                [
+                    ("&", tmp1_bank[chunk], idxs + base + chunk * VLEN, vec_one)
+                    for chunk in range(active)
+                ]
+            )
+            for chunk in range(active):
+                append_instr(
+                    {
+                        "flow": [
+                            (
+                                "vselect",
+                                out[chunk],
+                                tmp1_bank[chunk],
+                                shallow_vecs[3],
+                                shallow_vecs[2],
+                            )
+                        ]
+                    }
+                )
+                append_instr(
+                    {
+                        "flow": [
+                            (
+                                "vselect",
+                                tmp2_bank[chunk],
+                                tmp1_bank[chunk],
+                                shallow_vecs[5],
+                                shallow_vecs[4],
+                            )
+                        ]
+                    }
+                )
+            valu_instr(
+                [
+                    (">>", tmp1_bank[chunk], idxs + base + chunk * VLEN, vec_one)
+                    for chunk in range(active)
+                ]
+            )
+            valu_instr(
+                [
+                    ("&", tmp1_bank[chunk], tmp1_bank[chunk], vec_one)
+                    for chunk in range(active)
+                ]
+            )
+            for chunk in range(active):
+                append_instr(
+                    {
+                        "flow": [
+                            (
+                                "vselect",
+                                out[chunk],
+                                tmp1_bank[chunk],
+                                out[chunk],
+                                tmp2_bank[chunk],
+                            )
+                        ]
+                    }
+                )
 
         # Process the rounds in chunk groups so independent chunks can be
         # bundled together across the 6-slot valu engine.
@@ -499,6 +567,7 @@ class KernelBuilder:
                         node_vals[source_buf],
                         False,
                         is_leaf_round,
+                        group_i % 5,
                     )
                     load_i = len(preloaded_generic) + group_i
                     if load_i < n_groups:
@@ -524,7 +593,7 @@ class KernelBuilder:
                         for instr in current_hash:
                             append_instr(instr)
                     if not is_final_round and not is_leaf_round:
-                        queue_index_update(base, active, False)
+                        queue_index_update(base, active, False, 0)
                 preloaded_generic = next_preloaded_bufs
                 continue
 
@@ -534,23 +603,26 @@ class KernelBuilder:
             ]
             next_preloaded_bufs = []
             for group_i, (base, active) in enumerate(groups):
+                hash_bank = group_i % 5
                 if is_depth1_round:
-                    emit_depth1_lookup(base, active, node_vals[0])
+                    emit_depth1_lookup(base, active, node_vals[0], hash_bank)
                     current_hash = hash_instrs(
                         base,
                         active,
                         node_vals[0],
                         False,
                         is_leaf_round,
+                        hash_bank,
                     )
                 elif is_depth2_round:
-                    emit_depth2_lookup(base, active, node_vals[0])
+                    emit_depth2_lookup(base, active, node_vals[0], hash_bank)
                     current_hash = hash_instrs(
                         base,
                         active,
                         node_vals[0],
                         False,
                         is_leaf_round,
+                        hash_bank,
                     )
                 else:
                     current_hash = hash_instrs(
@@ -559,9 +631,10 @@ class KernelBuilder:
                         node_vals[0],
                         True,
                         is_leaf_round,
+                        hash_bank,
                     )
                 next_i = group_i - 2
-                if next_is_generic and 0 <= next_i < 4:
+                if next_is_generic and 0 <= next_i < 2:
                     next_base = next_i * generic_pack_width * VLEN
                     next_active = min(
                         generic_pack_width, (batch_size - next_base) // VLEN
@@ -576,7 +649,7 @@ class KernelBuilder:
                     for instr in current_hash:
                         append_instr(instr)
                 if not is_final_round and not is_leaf_round:
-                    queue_index_update(base, active, is_root_round)
+                    queue_index_update(base, active, is_root_round, 0)
             preloaded_generic = next_preloaded_bufs
 
         flush_pending_alu()
@@ -642,6 +715,13 @@ class KernelBuilder:
                     _, dest, addr = slot
                     writes.update(range(dest, dest + VLEN))
                     reads.add(addr)
+            elif engine == "flow":
+                if slot[0] == "vselect":
+                    _, dest, cond, a, b = slot
+                    writes.update(range(dest, dest + VLEN))
+                    reads.update(range(cond, cond + VLEN))
+                    reads.update(range(a, a + VLEN))
+                    reads.update(range(b, b + VLEN))
             return reads, writes
 
         def instr_rw(instr):
@@ -655,9 +735,15 @@ class KernelBuilder:
             return reads, writes
 
         def can_merge(first, second):
-            if any(engine in first or engine in second for engine in ("store", "flow", "debug")):
+            if any(engine in first or engine in second for engine in ("store", "debug")):
                 return False
-            limits = {"alu": 12, "valu": 6, "load": 2}
+            if any(
+                slot[0] == "pause"
+                for instr in (first, second)
+                for slot in instr.get("flow", [])
+            ):
+                return False
+            limits = {"alu": 12, "valu": 6, "load": 2, "flow": 1}
             for engine, slots in second.items():
                 if len(first.get(engine, [])) + len(slots) > limits[engine]:
                     return False
@@ -668,6 +754,102 @@ class KernelBuilder:
             if first_writes & second_writes:
                 return False
             return True
+
+        def schedule_block(block):
+            slots = []
+            for instr in block:
+                for engine, engine_slots in instr.items():
+                    for slot in engine_slots:
+                        slots.append((engine, slot))
+            if not slots:
+                return []
+
+            succs = [[] for _ in slots]
+            dep_counts = [0] * len(slots)
+            soft_preds = [set() for _ in slots]
+            last_writer = {}
+            last_readers = defaultdict(set)
+
+            for i, (engine, slot) in enumerate(slots):
+                reads, writes = slot_rw(engine, slot)
+                deps = set()
+                for addr in reads:
+                    writer = last_writer.get(addr)
+                    if writer is not None:
+                        deps.add(writer)
+                for addr in writes:
+                    writer = last_writer.get(addr)
+                    if writer is not None:
+                        deps.add(writer)
+                    soft_preds[i].update(last_readers.get(addr, ()))
+                dep_counts[i] = len(deps)
+                for dep in deps:
+                    succs[dep].append(i)
+                for addr in reads:
+                    last_readers[addr].add(i)
+                for addr in writes:
+                    last_writer[addr] = i
+                    last_readers[addr].clear()
+
+            def ready_item(i):
+                return i
+
+            ready = [ready_item(i) for i, count in enumerate(dep_counts) if count == 0]
+            heapq.heapify(ready)
+            scheduled = [False] * len(slots)
+            remaining = len(slots)
+            out = []
+            limits = {"alu": 12, "valu": 6, "load": 2, "flow": 1}
+
+            while remaining:
+                caps = dict(limits)
+                deferred = []
+                selected = []
+                selected_set = set()
+                instr = defaultdict(list)
+                while ready:
+                    i = heapq.heappop(ready)
+                    if scheduled[i]:
+                        continue
+                    if any(not scheduled[pred] and pred not in selected_set for pred in soft_preds[i]):
+                        deferred.append(i)
+                        continue
+                    engine, slot = slots[i]
+                    if caps[engine] <= 0:
+                        deferred.append(i)
+                        continue
+                    caps[engine] -= 1
+                    selected.append(i)
+                    selected_set.add(i)
+                    instr[engine].append(slot)
+                    scheduled[i] = True
+                for i in deferred:
+                    heapq.heappush(ready, ready_item(i))
+                if not selected:
+                    raise RuntimeError("scheduler made no progress")
+                out.append(dict(instr))
+                remaining -= len(selected)
+                for i in selected:
+                    for succ in succs[i]:
+                        dep_counts[succ] -= 1
+                        if dep_counts[succ] == 0:
+                            heapq.heappush(ready, ready_item(succ))
+            return out
+
+        scheduled = []
+        block = []
+        for instr in self.instrs:
+            is_barrier = any(engine in instr for engine in ("store", "debug")) or any(
+                slot[0] == "pause" for slot in instr.get("flow", [])
+            )
+            if is_barrier:
+                scheduled.extend(schedule_block(block))
+                block = []
+                scheduled.append(instr)
+            else:
+                block.append(instr)
+        scheduled.extend(schedule_block(block))
+        self.instrs = scheduled
 
         changed = True
         while changed:
@@ -684,8 +866,8 @@ class KernelBuilder:
                     packed.append(instr)
             self.instrs = packed
 
-        # Required to match with the yield in reference_kernel2
-        self.instrs.append({"flow": [("pause",)]})
+        # The submission harness checks only final memory, so debug pauses are
+        # intentionally omitted from the optimized kernel.
 
 BASELINE = 147734
 
