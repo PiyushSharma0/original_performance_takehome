@@ -715,6 +715,14 @@ class KernelBuilder:
                     _, dest, addr = slot
                     writes.update(range(dest, dest + VLEN))
                     reads.add(addr)
+            elif engine == "store":
+                if slot[0] == "store":
+                    _, addr, src = slot
+                    reads.update((addr, src))
+                elif slot[0] == "vstore":
+                    _, addr, src = slot
+                    reads.add(addr)
+                    reads.update(range(src, src + VLEN))
             elif engine == "flow":
                 if slot[0] == "vselect":
                     _, dest, cond, a, b = slot
@@ -735,7 +743,7 @@ class KernelBuilder:
             return reads, writes
 
         def can_merge(first, second):
-            if any(engine in first or engine in second for engine in ("store", "debug")):
+            if any(engine in first or engine in second for engine in ("debug",)):
                 return False
             if any(
                 slot[0] == "pause"
@@ -743,7 +751,7 @@ class KernelBuilder:
                 for slot in instr.get("flow", [])
             ):
                 return False
-            limits = {"alu": 12, "valu": 6, "load": 2, "flow": 1}
+            limits = {"alu": 12, "valu": 6, "load": 2, "flow": 1, "store": 2}
             for engine, slots in second.items():
                 if len(first.get(engine, [])) + len(slots) > limits[engine]:
                     return False
@@ -791,15 +799,26 @@ class KernelBuilder:
                     last_writer[addr] = i
                     last_readers[addr].clear()
 
+            weight = {"load": -7, "valu": 0, "alu": 1, "flow": -5, "store": -4}
+            height = [0] * len(slots)
+            for i in range(len(slots) - 1, -1, -1):
+                own = weight[slots[i][0]]
+                if succs[i]:
+                    height[i] = own + max(height[succ] for succ in succs[i])
+                else:
+                    height[i] = own
+
+            engine_priority = {"load": 0, "valu": 1, "alu": 2, "flow": 3, "store": 4}
+
             def ready_item(i):
-                return i
+                return (-height[i], -len(succs[i]), engine_priority[slots[i][0]], i)
 
             ready = [ready_item(i) for i, count in enumerate(dep_counts) if count == 0]
             heapq.heapify(ready)
             scheduled = [False] * len(slots)
             remaining = len(slots)
             out = []
-            limits = {"alu": 12, "valu": 6, "load": 2, "flow": 1}
+            limits = {"alu": 12, "valu": 6, "load": 2, "flow": 1, "store": 2}
 
             while remaining:
                 caps = dict(limits)
@@ -808,7 +827,7 @@ class KernelBuilder:
                 selected_set = set()
                 instr = defaultdict(list)
                 while ready:
-                    i = heapq.heappop(ready)
+                    _, _, _, i = heapq.heappop(ready)
                     if scheduled[i]:
                         continue
                     if any(not scheduled[pred] and pred not in selected_set for pred in soft_preds[i]):
@@ -839,7 +858,7 @@ class KernelBuilder:
         scheduled = []
         block = []
         for instr in self.instrs:
-            is_barrier = any(engine in instr for engine in ("store", "debug")) or any(
+            is_barrier = any(engine in instr for engine in ("debug",)) or any(
                 slot[0] == "pause" for slot in instr.get("flow", [])
             )
             if is_barrier:
